@@ -88,6 +88,58 @@ def clean_text_series(series: pd.Series) -> pd.Series:
     return series.astype(str).str.strip()
 
 
+def add_daily_week_coverage_flags(data: pd.DataFrame) -> pd.DataFrame:
+    """Add daily-row coverage to each weekly row before filtering to Weekly.
+
+    The export often contains both Daily and Weekly rows. The latest Weekly row
+    can be created from only 1-6 Daily rows, which causes false end-of-line
+    drops in production and feed. The 7_Days column is not reliable in this
+    workbook because it can simply say "Other", so we calculate coverage from
+    the Daily rows that share the same Farm/Flock/Week_End_Date.
+    """
+    if data is None or data.empty:
+        return data
+
+    required = {"Farm_Name", "Flock_Name", "Reporting_Period", "Week_End_Date"}
+    if not required.issubset(data.columns):
+        return data
+
+    out = data.copy()
+
+    # Normalised keys so trailing spaces in Eggsactly farm/flock names do not
+    # break the daily-to-weekly match.
+    out["_DailyCoverage_FarmKey"] = out["Farm_Name"].astype(str).str.strip()
+    out["_DailyCoverage_FlockKey"] = out["Flock_Name"].astype(str).str.strip()
+    out["_DailyCoverage_WeekEndKey"] = pd.to_datetime(out["Week_End_Date"], errors="coerce").dt.normalize()
+
+    period = out["Reporting_Period"].astype(str).str.strip().str.lower()
+    daily_counts = (
+        out.loc[
+            period.eq("daily") & out["_DailyCoverage_WeekEndKey"].notna(),
+            ["_DailyCoverage_FarmKey", "_DailyCoverage_FlockKey", "_DailyCoverage_WeekEndKey"],
+        ]
+        .groupby(["_DailyCoverage_FarmKey", "_DailyCoverage_FlockKey", "_DailyCoverage_WeekEndKey"], dropna=False)
+        .size()
+        .reset_index(name="_Daily_Rows_In_Week")
+    )
+
+    if daily_counts.empty:
+        out["_Daily_Rows_In_Week"] = np.nan
+    else:
+        out = out.merge(
+            daily_counts,
+            on=["_DailyCoverage_FarmKey", "_DailyCoverage_FlockKey", "_DailyCoverage_WeekEndKey"],
+            how="left",
+        )
+
+    out.drop(
+        columns=["_DailyCoverage_FarmKey", "_DailyCoverage_FlockKey", "_DailyCoverage_WeekEndKey"],
+        inplace=True,
+        errors="ignore",
+    )
+    return out
+
+
 def get_summary_row(summary: pd.DataFrame, farm_col: str, flock_col: str, farm: str, flock: str) -> pd.Series:
     if summary is None or summary.empty or farm_col not in summary.columns or flock_col not in summary.columns:
         return pd.Series(dtype=object)
@@ -202,6 +254,11 @@ def load_backend(data_sig, match_sig):
         for col in df.select_dtypes(include=["object"]).columns:
             df[col] = df[col].map(lambda v: v.strip() if isinstance(v, str) else v)
 
+    # IMPORTANT: calculate Daily-row coverage BEFORE filtering to weekly.
+    # This lets the app remove the latest incomplete Weekly row even when the
+    # workbook's 7_Days column is not populated with a true/false flag.
+    data = add_daily_week_coverage_flags(data)
+
     # IMPORTANT: graph weekly records only. The DATA sheet can contain multiple
     # reporting-period rows, and mixing daily/monthly helper rows with weekly
     # rows can make flock graphs look duplicated or incorrect.
@@ -314,7 +371,21 @@ def latest_partial_week_mask(df: pd.DataFrame) -> pd.Series:
         if ages.notna().any():
             latest_mask = ages.eq(ages.max())
 
-    if not latest_mask.any() or "7_Days" not in df.columns:
+    if not latest_mask.any():
+        return pd.Series(False, index=df.index)
+
+    # Best signal: count how many Daily rows were present for the same weekly
+    # period. If the latest weekly row was built from fewer than 7 daily rows,
+    # remove it when the checkbox is unticked.
+    if "_Daily_Rows_In_Week" in df.columns:
+        daily_count = pd.to_numeric(df["_Daily_Rows_In_Week"], errors="coerce")
+        latest_daily_count = daily_count.loc[latest_mask]
+        if latest_daily_count.notna().any():
+            incomplete_by_daily_count = latest_mask & daily_count.lt(7)
+            if incomplete_by_daily_count.any():
+                return incomplete_by_daily_count
+
+    if "7_Days" not in df.columns:
         return pd.Series(False, index=df.index)
 
     raw = df["7_Days"]
